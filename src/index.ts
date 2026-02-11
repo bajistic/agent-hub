@@ -7,6 +7,7 @@ import { initSchema } from './db/schema';
 import { setupWebSocket } from './api/ws';
 import apiRoutes from './api/routes';
 import { startTelegramBot } from './telegram/bot';
+import { startAllBots } from './telegram/botManager';
 
 async function main() {
   // Initialize database schema
@@ -50,6 +51,9 @@ async function main() {
 
   // Start Telegram bot
   startTelegramBot();
+
+  // Start registered sub-bots
+  await startAllBots();
 }
 
 process.on('uncaughtException', (err) => {

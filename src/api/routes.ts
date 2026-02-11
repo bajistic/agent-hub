@@ -7,10 +7,19 @@ import {
   setActiveAgent,
   resetAgent,
   updateAgentCwd,
+  updateAgentModel,
+  updateAgentEffort,
+  updateAgentPermissionMode,
+  updateAgentTools,
+  updateAgentSystemPrompt,
+  updateAgentBudget,
   sendAgentMessage,
   killRunningProcess,
+  getAgentCost,
+  forkAgent,
 } from '../manager';
-import { StreamChunk } from '../agents/claudeCode';
+import { StreamChunk, getVersion } from '../agents/claudeCode';
+import { registerBot, listBots, removeBot } from '../telegram/botManager';
 
 const router = Router();
 
@@ -89,6 +98,56 @@ router.patch('/agents/:id/cwd', async (req: Request, res: Response) => {
   }
 });
 
+// Update agent settings (model, effort, permission, prompt, budget)
+router.patch('/agents/:id/settings', async (req: Request, res: Response) => {
+  try {
+    const id = paramId(req);
+    const { model, effort, permission_mode, system_prompt, max_budget_usd } = req.body;
+
+    if (model !== undefined) await updateAgentModel(id, model);
+    if (effort !== undefined) await updateAgentEffort(id, effort);
+    if (permission_mode !== undefined) await updateAgentPermissionMode(id, permission_mode);
+    if (system_prompt !== undefined) await updateAgentSystemPrompt(id, system_prompt || null);
+    if (max_budget_usd !== undefined) await updateAgentBudget(id, max_budget_usd);
+
+    const agent = await getAgent(id);
+    res.json(agent);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update agent tools
+router.patch('/agents/:id/tools', async (req: Request, res: Response) => {
+  try {
+    const { allowed_tools, disallowed_tools } = req.body;
+    await updateAgentTools(paramId(req), allowed_tools ?? null, disallowed_tools ?? null);
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get agent cost
+router.get('/agents/:id/cost', async (req: Request, res: Response) => {
+  try {
+    const cost = await getAgentCost(paramId(req));
+    res.json(cost);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Fork agent
+router.post('/agents/:id/fork', async (req: Request, res: Response) => {
+  try {
+    const forked = await forkAgent(paramId(req), 'default');
+    res.status(201).json(forked);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Send message (non-streaming HTTP)
 router.post('/agents/:id/message', async (req: Request, res: Response) => {
   try {
@@ -152,6 +211,57 @@ router.post('/agents/:id/message/stream', async (req: Request, res: Response) =>
 router.post('/agents/:id/kill', async (req: Request, res: Response) => {
   const killed = killRunningProcess(paramId(req));
   res.json({ ok: true, killed });
+});
+
+// Claude version
+router.get('/version', async (_req: Request, res: Response) => {
+  try {
+    const version = await getVersion();
+    res.json({ version });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Bot management
+router.get('/bots', async (_req: Request, res: Response) => {
+  try {
+    const bots = await listBots();
+    // Don't expose tokens
+    const safe = bots.map((b: any) => ({
+      id: b.id,
+      name: b.name,
+      agent_id: b.agent_id,
+      chat_id: b.chat_id,
+      is_active: b.is_active,
+    }));
+    res.json(safe);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/bots', async (req: Request, res: Response) => {
+  try {
+    const { name, token, agent_id, chat_id } = req.body;
+    if (!name || !token) {
+      res.status(400).json({ error: 'name and token are required' });
+      return;
+    }
+    await registerBot(name, token, agent_id, chat_id);
+    res.status(201).json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete('/bots/:name', async (req: Request, res: Response) => {
+  try {
+    await removeBot(req.params.name as string);
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 export default router;

@@ -38,6 +38,7 @@
           <div class="flex items-center justify-between">
             <span class="font-medium text-sm" x-text="agent.name"></span>
             <div class="flex items-center gap-1">
+              <span class="text-xs text-gray-500" x-text="agent.model"></span>
               <span
                 x-show="agent.is_active"
                 class="w-2 h-2 rounded-full bg-green-500"
@@ -51,6 +52,7 @@
             </div>
           </div>
           <div class="text-xs text-gray-500 truncate mt-1" x-text="agent.cwd"></div>
+          <div x-show="agent.total_cost_usd > 0" class="text-xs text-yellow-600 mt-0.5" x-text="'$' + Number(agent.total_cost_usd).toFixed(4)"></div>
         </div>
       </template>
     </div>
@@ -76,6 +78,25 @@
         </button>
       </div>
     </div>
+
+    <!-- Bot section -->
+    <div class="p-3 border-t border-gray-800">
+      <div class="flex items-center justify-between mb-2">
+        <span class="text-xs font-medium text-gray-400">Bots</span>
+        <button @click="showBotForm = !showBotForm" class="text-xs text-purple-400 hover:text-purple-300">+ Add</button>
+      </div>
+      <div x-show="showBotForm" class="space-y-2 mb-2">
+        <input x-model="newBot.name" placeholder="Bot name" class="w-full bg-gray-800 text-xs rounded px-2 py-1.5 border border-gray-700 outline-none">
+        <input x-model="newBot.token" placeholder="Bot token" type="password" class="w-full bg-gray-800 text-xs rounded px-2 py-1.5 border border-gray-700 outline-none">
+        <button @click="addBot()" class="w-full bg-gray-700 hover:bg-gray-600 text-xs rounded px-2 py-1.5">Register Bot</button>
+      </div>
+      <template x-for="b in bots" :key="b.id">
+        <div class="flex items-center justify-between text-xs py-1">
+          <span :class="b.is_active ? 'text-green-400' : 'text-gray-500'" x-text="b.name"></span>
+          <button @click="deleteBot(b.name)" class="text-gray-600 hover:text-red-400">&times;</button>
+        </div>
+      </template>
+    </div>
   </div>
 
   <!-- Chat panel -->
@@ -88,6 +109,14 @@
       </div>
       <div class="flex gap-2">
         <button
+          @click="showSettings = !showSettings"
+          class="text-xs bg-gray-800 hover:bg-gray-700 rounded px-3 py-1"
+        >Settings</button>
+        <button
+          @click="forkAgent()"
+          class="text-xs bg-gray-800 hover:bg-gray-700 rounded px-3 py-1"
+        >Fork</button>
+        <button
           @click="resetConversation()"
           class="text-xs bg-gray-800 hover:bg-gray-700 rounded px-3 py-1"
         >Reset</button>
@@ -96,6 +125,63 @@
           class="text-xs bg-purple-600/30 hover:bg-purple-600/50 rounded px-3 py-1"
           x-show="!selectedAgent?.is_active"
         >Set Active</button>
+      </div>
+    </div>
+
+    <!-- Settings Panel -->
+    <div x-show="showSettings && selectedAgent" x-cloak class="p-4 border-b border-gray-800 bg-gray-900/50 space-y-3">
+      <div class="grid grid-cols-3 gap-3">
+        <div>
+          <label class="block text-xs text-gray-400 mb-1">Model</label>
+          <select
+            x-model="settings.model"
+            @change="saveSettings()"
+            class="w-full bg-gray-800 text-sm rounded px-2 py-1.5 border border-gray-700 outline-none"
+          >
+            <option value="sonnet">Sonnet</option>
+            <option value="opus">Opus</option>
+            <option value="haiku">Haiku</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs text-gray-400 mb-1">Effort</label>
+          <select
+            x-model="settings.effort"
+            @change="saveSettings()"
+            class="w-full bg-gray-800 text-sm rounded px-2 py-1.5 border border-gray-700 outline-none"
+          >
+            <option value="high">High</option>
+            <option value="medium">Medium</option>
+            <option value="low">Low</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs text-gray-400 mb-1">Permission</label>
+          <select
+            x-model="settings.permission_mode"
+            @change="saveSettings()"
+            class="w-full bg-gray-800 text-sm rounded px-2 py-1.5 border border-gray-700 outline-none"
+          >
+            <option value="bypassPermissions">Bypass All</option>
+            <option value="acceptEdits">Accept Edits</option>
+            <option value="default">Default</option>
+          </select>
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs text-gray-400 mb-1">System Prompt</label>
+        <textarea
+          x-model="settings.system_prompt"
+          @change="saveSettings()"
+          rows="2"
+          placeholder="Optional system prompt..."
+          class="w-full bg-gray-800 text-sm rounded px-3 py-2 border border-gray-700 outline-none resize-none"
+        ></textarea>
+      </div>
+      <div class="flex items-center gap-4 text-xs text-gray-400">
+        <span x-show="costData">Cost: $<span x-text="costData?.total_cost_usd?.toFixed(4) || '0.0000'"></span></span>
+        <span x-show="costData">Requests: <span x-text="costData?.request_count || 0"></span></span>
+        <span x-show="costData">Tokens: <span x-text="((costData?.total_input_tokens || 0) + (costData?.total_output_tokens || 0)).toLocaleString()"></span></span>
       </div>
     </div>
 
@@ -170,6 +256,12 @@ function app() {
     newAgent: { name: '', cwd: '/home/bajistic' },
     apiKey: localStorage.getItem('agentHubApiKey') || '',
     streamBuffer: '',
+    showSettings: false,
+    settings: { model: 'sonnet', effort: 'high', permission_mode: 'bypassPermissions', system_prompt: '' },
+    costData: null,
+    bots: [],
+    showBotForm: false,
+    newBot: { name: '', token: '' },
 
     async init() {
       if (!this.apiKey) {
@@ -177,6 +269,7 @@ function app() {
         if (this.apiKey) localStorage.setItem('agentHubApiKey', this.apiKey);
       }
       await this.loadAgents();
+      await this.loadBots();
     },
 
     headers() {
@@ -194,10 +287,35 @@ function app() {
       }
     },
 
+    async loadBots() {
+      try {
+        const r = await fetch('/agents/api/bots', { headers: this.headers() });
+        this.bots = await r.json();
+      } catch (e) {
+        console.error('Failed to load bots:', e);
+      }
+    },
+
     selectAgent(agent) {
       this.selectedAgent = agent;
       this.messages = [];
+      this.settings = {
+        model: agent.model || 'sonnet',
+        effort: agent.effort || 'high',
+        permission_mode: agent.permission_mode || 'bypassPermissions',
+        system_prompt: agent.system_prompt || '',
+      };
+      this.loadCost(agent.id);
       this.connectWs(agent.id);
+    },
+
+    async loadCost(agentId) {
+      try {
+        const r = await fetch(`/agents/api/agents/${agentId}/cost`, { headers: this.headers() });
+        this.costData = await r.json();
+      } catch (e) {
+        console.error('Failed to load cost:', e);
+      }
     },
 
     connectWs(agentId) {
@@ -216,6 +334,7 @@ function app() {
           } else if (chunk.type === 'done') {
             this.isProcessing = false;
             this.streamBuffer = '';
+            if (this.selectedAgent) this.loadCost(this.selectedAgent.id);
           } else if (chunk.type === 'error') {
             this.messages.push({ role: 'assistant', content: 'Error: ' + chunk.content });
             this.isProcessing = false;
@@ -300,6 +419,69 @@ function app() {
         await this.loadAgents();
       } catch (e) {
         console.error('Failed to set active:', e);
+      }
+    },
+
+    async saveSettings() {
+      if (!this.selectedAgent) return;
+      try {
+        const r = await fetch(`/agents/api/agents/${this.selectedAgent.id}/settings`, {
+          method: 'PATCH',
+          headers: this.headers(),
+          body: JSON.stringify(this.settings),
+        });
+        const updated = await r.json();
+        // Update local state
+        const idx = this.agents.findIndex(a => a.id === this.selectedAgent.id);
+        if (idx >= 0) Object.assign(this.agents[idx], updated);
+        Object.assign(this.selectedAgent, updated);
+      } catch (e) {
+        console.error('Failed to save settings:', e);
+      }
+    },
+
+    async forkAgent() {
+      if (!this.selectedAgent) return;
+      try {
+        const r = await fetch(`/agents/api/agents/${this.selectedAgent.id}/fork`, {
+          method: 'POST',
+          headers: this.headers(),
+        });
+        const forked = await r.json();
+        await this.loadAgents();
+        this.selectAgent(forked);
+      } catch (e) {
+        console.error('Failed to fork agent:', e);
+      }
+    },
+
+    async addBot() {
+      if (!this.newBot.name || !this.newBot.token) return;
+      try {
+        await fetch('/agents/api/bots', {
+          method: 'POST',
+          headers: this.headers(),
+          body: JSON.stringify({
+            name: this.newBot.name,
+            token: this.newBot.token,
+            agent_id: this.selectedAgent?.id,
+          }),
+        });
+        this.newBot = { name: '', token: '' };
+        this.showBotForm = false;
+        await this.loadBots();
+      } catch (e) {
+        console.error('Failed to add bot:', e);
+      }
+    },
+
+    async deleteBot(name) {
+      if (!confirm(`Remove bot "${name}"?`)) return;
+      try {
+        await fetch(`/agents/api/bots/${name}`, { method: 'DELETE', headers: this.headers() });
+        await this.loadBots();
+      } catch (e) {
+        console.error('Failed to remove bot:', e);
       }
     },
 
