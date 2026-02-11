@@ -9,6 +9,7 @@ import {
   deleteAgent,
   resetAgent,
   updateAgentCwd,
+  updateAgentSession,
   updateAgentModel,
   updateAgentEffort,
   updateAgentPermissionMode,
@@ -25,12 +26,17 @@ import { StreamChunk, getVersion } from '../agents/claudeCode';
 import { isAdmin, requireActiveAgent, splitMessage, sendLongMessage } from './helpers';
 import { registerBot, listBots, removeBot } from './botManager';
 
-export function setupHandlers(bot: TelegramBot) {
-  // /help
-  bot.onText(/\/help/, async (msg) => {
-    if (!isAdmin(msg.chat.id)) return;
+type CommandHandler = (bot: TelegramBot, msg: TelegramBot.Message, args: string) => Promise<void>;
 
-    const help = `*Agent Hub Commands*
+const commands: Record<string, CommandHandler> = {};
+
+function cmd(name: string, handler: CommandHandler) {
+  commands[name] = handler;
+}
+
+// ── /help ──
+cmd('help', async (bot, msg) => {
+  const help = `*Agent Hub Commands*
 
 *Agent Management*
 /spawn \\[name] \\[cwd] — Create new agent
@@ -50,6 +56,7 @@ export function setupHandlers(bot: TelegramBot) {
 /system \\[prompt] — View/set system prompt
 
 *Session*
+/session \\[id] — View/attach Claude session ID
 /continue — Resume most recent conversation
 /compact — Compress conversation context
 /cost — Show cost & token usage
@@ -63,330 +70,257 @@ export function setupHandlers(bot: TelegramBot) {
 /bots — List registered bots
 /removebot <name> — Remove a bot`;
 
-    await sendLongMessage(bot, msg.chat.id, help, 'Markdown');
-  });
+  await sendLongMessage(bot, msg.chat.id, help, 'Markdown');
+});
 
-  // /spawn [name] [cwd]
-  bot.onText(/\/spawn(?:\s+(\S+))?(?:\s+(.+))?/, async (msg, match) => {
-    if (!isAdmin(msg.chat.id)) return;
+// ── /spawn [name] [cwd] ──
+cmd('spawn', async (bot, msg, args) => {
+  const parts = args.split(/\s+/);
+  const name = parts[0] || `agent-${Date.now()}`;
+  const cwd = parts.slice(1).join(' ') || config.defaults.cwd;
+  const chatId = msg.chat.id.toString();
 
-    const name = match?.[1] || `agent-${Date.now()}`;
-    const cwd = match?.[2] || config.defaults.cwd;
-    const chatId = msg.chat.id.toString();
+  const agent = await createAgent(chatId, name, cwd, chatId);
+  await bot.sendMessage(msg.chat.id,
+    `Agent spawned: *${agent.name}*\nID: \`${agent.id}\`\nCWD: \`${agent.cwd}\`\nSet as active agent.`,
+    { parse_mode: 'Markdown' },
+  );
+});
 
-    try {
-      const agent = await createAgent(chatId, name, cwd, chatId);
-      await bot.sendMessage(msg.chat.id,
-        `Agent spawned: *${agent.name}*\nID: \`${agent.id}\`\nCWD: \`${agent.cwd}\`\nSet as active agent.`,
-        { parse_mode: 'Markdown' },
-      );
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
+// ── /agents ──
+cmd('agents', async (bot, msg) => {
+  const agents = await listAgents(msg.chat.id.toString());
+  if (agents.length === 0) {
+    await bot.sendMessage(msg.chat.id, 'No agents. Use /spawn <name> to create one.');
+    return;
+  }
 
-  // /agents
-  bot.onText(/\/agents/, async (msg) => {
-    if (!isAdmin(msg.chat.id)) return;
+  const lines = agents.map((a: AgentRow) =>
+    `${a.is_active ? '→ ' : '  '}*${a.name}* \`${a.id.slice(0, 8)}\` (${a.model})\n   CWD: \`${a.cwd}\`${a.claude_session_id ? ' (session)' : ''}`,
+  );
+  await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'Markdown' });
+});
 
-    try {
-      const agents = await listAgents(msg.chat.id.toString());
-      if (agents.length === 0) {
-        await bot.sendMessage(msg.chat.id, 'No agents. Use /spawn <name> to create one.');
-        return;
-      }
+// ── /switch <name|id> ──
+cmd('switch', async (bot, msg, args) => {
+  const target = args.trim();
+  if (!target) {
+    await bot.sendMessage(msg.chat.id, 'Usage: /switch <name|id>');
+    return;
+  }
 
-      const lines = agents.map((a: AgentRow) =>
-        `${a.is_active ? '→ ' : '  '}*${a.name}* \`${a.id.slice(0, 8)}\` (${a.model})\n   CWD: \`${a.cwd}\`${a.claude_session_id ? ' (session)' : ''}`,
-      );
-      await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'Markdown' });
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
+  const agents = await listAgents(msg.chat.id.toString());
+  const agent = agents.find((a: AgentRow) =>
+    a.name === target || a.id === target || a.id.startsWith(target),
+  );
 
-  // /switch <name|id>
-  bot.onText(/\/switch\s+(.+)/, async (msg, match) => {
-    if (!isAdmin(msg.chat.id)) return;
+  if (!agent) {
+    await bot.sendMessage(msg.chat.id, `Agent "${target}" not found.`);
+    return;
+  }
 
-    const target = match?.[1]?.trim();
-    if (!target) return;
+  await setActiveAgent(msg.chat.id.toString(), agent.id);
+  await bot.sendMessage(msg.chat.id, `Switched to *${agent.name}*`, { parse_mode: 'Markdown' });
+});
 
-    try {
-      const agents = await listAgents(msg.chat.id.toString());
-      const agent = agents.find((a: AgentRow) =>
-        a.name === target || a.id === target || a.id.startsWith(target),
-      );
+// ── /kill <name|id> ──
+cmd('kill', async (bot, msg, args) => {
+  const target = args.trim();
+  if (!target) {
+    await bot.sendMessage(msg.chat.id, 'Usage: /kill <name|id>');
+    return;
+  }
 
-      if (!agent) {
-        await bot.sendMessage(msg.chat.id, `Agent "${target}" not found.`);
-        return;
-      }
+  const agents = await listAgents(msg.chat.id.toString());
+  const agent = agents.find((a: AgentRow) =>
+    a.name === target || a.id === target || a.id.startsWith(target),
+  );
 
-      await setActiveAgent(msg.chat.id.toString(), agent.id);
-      await bot.sendMessage(msg.chat.id,
-        `Switched to *${agent.name}*`,
-        { parse_mode: 'Markdown' },
-      );
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
+  if (!agent) {
+    await bot.sendMessage(msg.chat.id, `Agent "${target}" not found.`);
+    return;
+  }
 
-  // /kill <name|id>
-  bot.onText(/\/kill\s+(.+)/, async (msg, match) => {
-    if (!isAdmin(msg.chat.id)) return;
+  await deleteAgent(agent.id);
+  await bot.sendMessage(msg.chat.id, `Agent *${agent.name}* killed.`, { parse_mode: 'Markdown' });
+});
 
-    const target = match?.[1]?.trim();
-    if (!target) return;
+// ── /reset ──
+cmd('reset', async (bot, msg) => {
+  const agent = await requireActiveAgent(bot, msg.chat.id);
+  if (!agent) return;
 
-    try {
-      const agents = await listAgents(msg.chat.id.toString());
-      const agent = agents.find((a: AgentRow) =>
-        a.name === target || a.id === target || a.id.startsWith(target),
-      );
+  await resetAgent(agent.id);
+  await bot.sendMessage(msg.chat.id, `Conversation reset for *${agent.name}*`, { parse_mode: 'Markdown' });
+});
 
-      if (!agent) {
-        await bot.sendMessage(msg.chat.id, `Agent "${target}" not found.`);
-        return;
-      }
+// ── /cwd <path> ──
+cmd('cwd', async (bot, msg, args) => {
+  const newCwd = args.trim();
+  if (!newCwd) {
+    await bot.sendMessage(msg.chat.id, 'Usage: /cwd <path>');
+    return;
+  }
 
-      await deleteAgent(agent.id);
-      await bot.sendMessage(msg.chat.id, `Agent *${agent.name}* killed.`, { parse_mode: 'Markdown' });
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
+  const agent = await requireActiveAgent(bot, msg.chat.id);
+  if (!agent) return;
 
-  // /reset
-  bot.onText(/\/reset/, async (msg) => {
-    if (!isAdmin(msg.chat.id)) return;
+  await updateAgentCwd(agent.id, newCwd);
+  await bot.sendMessage(msg.chat.id, `CWD for *${agent.name}* → \`${newCwd}\``, { parse_mode: 'Markdown' });
+});
 
-    try {
-      const agent = await requireActiveAgent(bot, msg.chat.id);
-      if (!agent) return;
+// ── /model [model] ──
+cmd('model', async (bot, msg, args) => {
+  const agent = await requireActiveAgent(bot, msg.chat.id);
+  if (!agent) return;
 
-      await resetAgent(agent.id);
-      await bot.sendMessage(msg.chat.id,
-        `Conversation reset for *${agent.name}*`,
-        { parse_mode: 'Markdown' },
-      );
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
+  const model = args.trim();
+  if (!model) {
+    await bot.sendMessage(msg.chat.id, `Model for *${agent.name}*: \`${agent.model}\``, { parse_mode: 'Markdown' });
+    return;
+  }
 
-  // /cwd <path>
-  bot.onText(/\/cwd\s+(.+)/, async (msg, match) => {
-    if (!isAdmin(msg.chat.id)) return;
+  const valid = ['opus', 'sonnet', 'haiku'];
+  if (!valid.includes(model)) {
+    await bot.sendMessage(msg.chat.id, `Invalid model. Choose: ${valid.join(', ')}`);
+    return;
+  }
 
-    const newCwd = match?.[1]?.trim();
-    if (!newCwd) return;
+  await updateAgentModel(agent.id, model);
+  await bot.sendMessage(msg.chat.id, `Model set to \`${model}\` for *${agent.name}*`, { parse_mode: 'Markdown' });
+});
 
-    try {
-      const agent = await requireActiveAgent(bot, msg.chat.id);
-      if (!agent) return;
+// ── /effort [level] ──
+cmd('effort', async (bot, msg, args) => {
+  const agent = await requireActiveAgent(bot, msg.chat.id);
+  if (!agent) return;
 
-      await updateAgentCwd(agent.id, newCwd);
-      await bot.sendMessage(msg.chat.id,
-        `CWD for *${agent.name}* → \`${newCwd}\``,
-        { parse_mode: 'Markdown' },
-      );
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
+  const effort = args.trim();
+  if (!effort) {
+    await bot.sendMessage(msg.chat.id, `Effort for *${agent.name}*: \`${agent.effort}\``, { parse_mode: 'Markdown' });
+    return;
+  }
 
-  // /model [model]
-  bot.onText(/\/model(?:\s+(.+))?/, async (msg, match) => {
-    if (!isAdmin(msg.chat.id)) return;
+  const valid = ['low', 'medium', 'high'];
+  if (!valid.includes(effort)) {
+    await bot.sendMessage(msg.chat.id, `Invalid effort. Choose: ${valid.join(', ')}`);
+    return;
+  }
 
-    try {
-      const agent = await requireActiveAgent(bot, msg.chat.id);
-      if (!agent) return;
+  await updateAgentEffort(agent.id, effort);
+  await bot.sendMessage(msg.chat.id, `Effort set to \`${effort}\` for *${agent.name}*`, { parse_mode: 'Markdown' });
+});
 
-      const model = match?.[1]?.trim();
-      if (!model) {
-        await bot.sendMessage(msg.chat.id, `Model for *${agent.name}*: \`${agent.model}\``, { parse_mode: 'Markdown' });
-        return;
-      }
+// ── /permission [mode] ──
+cmd('permission', async (bot, msg, args) => {
+  const agent = await requireActiveAgent(bot, msg.chat.id);
+  if (!agent) return;
 
-      const valid = ['opus', 'sonnet', 'haiku'];
-      if (!valid.includes(model)) {
-        await bot.sendMessage(msg.chat.id, `Invalid model. Choose: ${valid.join(', ')}`);
-        return;
-      }
+  const mode = args.trim();
+  if (!mode) {
+    await bot.sendMessage(msg.chat.id,
+      `Permission mode for *${agent.name}*: \`${agent.permission_mode}\`\nOptions: bypassPermissions, acceptEdits, default`,
+      { parse_mode: 'Markdown' },
+    );
+    return;
+  }
 
-      await updateAgentModel(agent.id, model);
-      await bot.sendMessage(msg.chat.id, `Model set to \`${model}\` for *${agent.name}*`, { parse_mode: 'Markdown' });
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
+  const valid = ['bypassPermissions', 'acceptEdits', 'default'];
+  if (!valid.includes(mode)) {
+    await bot.sendMessage(msg.chat.id, `Invalid mode. Choose: ${valid.join(', ')}`);
+    return;
+  }
 
-  // /effort [level]
-  bot.onText(/\/effort(?:\s+(.+))?/, async (msg, match) => {
-    if (!isAdmin(msg.chat.id)) return;
+  await updateAgentPermissionMode(agent.id, mode);
+  await bot.sendMessage(msg.chat.id, `Permission mode set to \`${mode}\``, { parse_mode: 'Markdown' });
+});
 
-    try {
-      const agent = await requireActiveAgent(bot, msg.chat.id);
-      if (!agent) return;
+// ── /tools [allow|deny|clear] [list] ──
+cmd('tools', async (bot, msg, args) => {
+  const agent = await requireActiveAgent(bot, msg.chat.id);
+  if (!agent) return;
 
-      const effort = match?.[1]?.trim();
-      if (!effort) {
-        await bot.sendMessage(msg.chat.id, `Effort for *${agent.name}*: \`${agent.effort}\``, { parse_mode: 'Markdown' });
-        return;
-      }
+  const parts = args.trim().split(/\s+/);
+  const action = parts[0];
+  const toolList = parts.slice(1).join(' ');
 
-      const valid = ['low', 'medium', 'high'];
-      if (!valid.includes(effort)) {
-        await bot.sendMessage(msg.chat.id, `Invalid effort. Choose: ${valid.join(', ')}`);
-        return;
-      }
+  if (!action) {
+    const allowed = agent.allowed_tools || 'none';
+    const denied = agent.disallowed_tools || 'none';
+    await bot.sendMessage(msg.chat.id,
+      `*Tools for ${agent.name}*\nAllowed: \`${allowed}\`\nDenied: \`${denied}\``,
+      { parse_mode: 'Markdown' },
+    );
+    return;
+  }
 
-      await updateAgentEffort(agent.id, effort);
-      await bot.sendMessage(msg.chat.id, `Effort set to \`${effort}\` for *${agent.name}*`, { parse_mode: 'Markdown' });
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
+  if (action === 'clear') {
+    await updateAgentTools(agent.id, null, null);
+    await bot.sendMessage(msg.chat.id, 'Tool filters cleared.');
+    return;
+  }
 
-  // /permission [mode]
-  bot.onText(/\/permission(?:\s+(.+))?/, async (msg, match) => {
-    if (!isAdmin(msg.chat.id)) return;
+  if ((action === 'allow' || action === 'deny') && !toolList) {
+    await bot.sendMessage(msg.chat.id, `Usage: /tools ${action} Tool1,Tool2,...`);
+    return;
+  }
 
-    try {
-      const agent = await requireActiveAgent(bot, msg.chat.id);
-      if (!agent) return;
+  if (action === 'allow') {
+    await updateAgentTools(agent.id, toolList, agent.disallowed_tools);
+  } else if (action === 'deny') {
+    await updateAgentTools(agent.id, agent.allowed_tools, toolList);
+  } else {
+    await bot.sendMessage(msg.chat.id, 'Usage: /tools [allow|deny|clear] [list]');
+    return;
+  }
 
-      const mode = match?.[1]?.trim();
-      if (!mode) {
-        await bot.sendMessage(msg.chat.id,
-          `Permission mode for *${agent.name}*: \`${agent.permission_mode}\`\nOptions: bypassPermissions, acceptEdits, default`,
-          { parse_mode: 'Markdown' },
-        );
-        return;
-      }
+  await bot.sendMessage(msg.chat.id, `Tools updated: ${action} → \`${toolList}\``, { parse_mode: 'Markdown' });
+});
 
-      const valid = ['bypassPermissions', 'acceptEdits', 'default'];
-      if (!valid.includes(mode)) {
-        await bot.sendMessage(msg.chat.id, `Invalid mode. Choose: ${valid.join(', ')}`);
-        return;
-      }
+// ── /system [prompt] ──
+cmd('system', async (bot, msg, args) => {
+  const agent = await requireActiveAgent(bot, msg.chat.id);
+  if (!agent) return;
 
-      await updateAgentPermissionMode(agent.id, mode);
-      await bot.sendMessage(msg.chat.id, `Permission mode set to \`${mode}\``, { parse_mode: 'Markdown' });
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
+  const prompt = args.trim();
+  if (!prompt) {
+    const current = agent.system_prompt || '(none)';
+    await bot.sendMessage(msg.chat.id, `*System prompt for ${agent.name}:*\n${current}`, { parse_mode: 'Markdown' });
+    return;
+  }
 
-  // /tools [allow|deny|clear] [list]
-  bot.onText(/\/tools(?:\s+(allow|deny|clear))?(?:\s+(.+))?/, async (msg, match) => {
-    if (!isAdmin(msg.chat.id)) return;
+  if (prompt === 'clear') {
+    await updateAgentSystemPrompt(agent.id, null);
+    await bot.sendMessage(msg.chat.id, 'System prompt cleared.');
+    return;
+  }
 
-    try {
-      const agent = await requireActiveAgent(bot, msg.chat.id);
-      if (!agent) return;
+  await updateAgentSystemPrompt(agent.id, prompt);
+  await bot.sendMessage(msg.chat.id, 'System prompt updated.');
+});
 
-      const action = match?.[1];
-      const toolList = match?.[2]?.trim();
+// ── /cost ──
+cmd('cost', async (bot, msg) => {
+  const agent = await requireActiveAgent(bot, msg.chat.id);
+  if (!agent) return;
 
-      if (!action) {
-        const allowed = agent.allowed_tools || 'none';
-        const denied = agent.disallowed_tools || 'none';
-        await bot.sendMessage(msg.chat.id,
-          `*Tools for ${agent.name}*\nAllowed: \`${allowed}\`\nDenied: \`${denied}\``,
-          { parse_mode: 'Markdown' },
-        );
-        return;
-      }
-
-      if (action === 'clear') {
-        await updateAgentTools(agent.id, null, null);
-        await bot.sendMessage(msg.chat.id, 'Tool filters cleared.');
-        return;
-      }
-
-      if (!toolList) {
-        await bot.sendMessage(msg.chat.id, `Usage: /tools ${action} Tool1,Tool2,...`);
-        return;
-      }
-
-      if (action === 'allow') {
-        await updateAgentTools(agent.id, toolList, agent.disallowed_tools);
-      } else {
-        await updateAgentTools(agent.id, agent.allowed_tools, toolList);
-      }
-
-      await bot.sendMessage(msg.chat.id, `Tools updated: ${action} → \`${toolList}\``, { parse_mode: 'Markdown' });
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
-
-  // /system [prompt]
-  bot.onText(/\/system(?:\s+([\s\S]+))?/, async (msg, match) => {
-    if (!isAdmin(msg.chat.id)) return;
-
-    try {
-      const agent = await requireActiveAgent(bot, msg.chat.id);
-      if (!agent) return;
-
-      const prompt = match?.[1]?.trim();
-      if (!prompt) {
-        const current = agent.system_prompt || '(none)';
-        await bot.sendMessage(msg.chat.id,
-          `*System prompt for ${agent.name}:*\n${current}`,
-          { parse_mode: 'Markdown' },
-        );
-        return;
-      }
-
-      if (prompt === 'clear') {
-        await updateAgentSystemPrompt(agent.id, null);
-        await bot.sendMessage(msg.chat.id, 'System prompt cleared.');
-        return;
-      }
-
-      await updateAgentSystemPrompt(agent.id, prompt);
-      await bot.sendMessage(msg.chat.id, 'System prompt updated.');
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
-
-  // /cost
-  bot.onText(/\/cost/, async (msg) => {
-    if (!isAdmin(msg.chat.id)) return;
-
-    try {
-      const agent = await requireActiveAgent(bot, msg.chat.id);
-      if (!agent) return;
-
-      const cost = await getAgentCost(agent.id);
-      const text = `*Cost for ${agent.name}*
+  const cost = await getAgentCost(agent.id);
+  const text = `*Cost for ${agent.name}*
 Total: $${cost.total_cost_usd.toFixed(4)}
 Requests: ${cost.request_count}
 Input tokens: ${cost.total_input_tokens.toLocaleString()}
 Output tokens: ${cost.total_output_tokens.toLocaleString()}`;
 
-      await bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
+  await bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+});
 
-  // /status
-  bot.onText(/\/status/, async (msg) => {
-    if (!isAdmin(msg.chat.id)) return;
+// ── /status ──
+cmd('status', async (bot, msg) => {
+  const agent = await requireActiveAgent(bot, msg.chat.id);
+  if (!agent) return;
 
-    try {
-      const agent = await requireActiveAgent(bot, msg.chat.id);
-      if (!agent) return;
-
-      const cost = await getAgentCost(agent.id);
-      const text = `*${agent.name}* \`${agent.id.slice(0, 8)}\`
+  const cost = await getAgentCost(agent.id);
+  const text = `*${agent.name}* \`${agent.id.slice(0, 8)}\`
 Model: \`${agent.model}\`
 Effort: \`${agent.effort}\`
 Permission: \`${agent.permission_mode}\`
@@ -400,236 +334,224 @@ Total cost: $${cost.total_cost_usd.toFixed(4)}
 Requests: ${cost.request_count}
 Last duration: ${agent.last_duration_ms ? (agent.last_duration_ms / 1000).toFixed(1) + 's' : 'n/a'}`;
 
-      await bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
+  await bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+});
 
-  // /context — show token/context usage
-  bot.onText(/\/context/, async (msg) => {
-    if (!isAdmin(msg.chat.id)) return;
+// ── /context ──
+cmd('context', async (bot, msg) => {
+  const agent = await requireActiveAgent(bot, msg.chat.id);
+  if (!agent) return;
 
-    try {
-      const agent = await requireActiveAgent(bot, msg.chat.id);
-      if (!agent) return;
-
-      const cost = await getAgentCost(agent.id);
-      const text = `*Context for ${agent.name}*
+  const cost = await getAgentCost(agent.id);
+  const text = `*Context for ${agent.name}*
 Session: \`${agent.claude_session_id ? 'active' : 'none'}\`
 Total input tokens: ${cost.total_input_tokens.toLocaleString()}
 Total output tokens: ${cost.total_output_tokens.toLocaleString()}
 Total tokens: ${(cost.total_input_tokens + cost.total_output_tokens).toLocaleString()}`;
 
-      await bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
+  await bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+});
 
-  // /version
-  bot.onText(/\/version/, async (msg) => {
-    if (!isAdmin(msg.chat.id)) return;
+// ── /version ──
+cmd('version', async (bot, msg) => {
+  const version = await getVersion();
+  await bot.sendMessage(msg.chat.id, `Claude CLI: \`${version}\``, { parse_mode: 'Markdown' });
+});
 
-    try {
-      const version = await getVersion();
-      await bot.sendMessage(msg.chat.id, `Claude CLI: \`${version}\``, { parse_mode: 'Markdown' });
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
+// ── /diff ──
+cmd('diff', async (bot, msg) => {
+  const agent = await requireActiveAgent(bot, msg.chat.id);
+  if (!agent) return;
 
-  // /diff — git diff --stat in agent CWD
-  bot.onText(/\/diff/, async (msg) => {
-    if (!isAdmin(msg.chat.id)) return;
-
-    try {
-      const agent = await requireActiveAgent(bot, msg.chat.id);
-      if (!agent) return;
-
-      const result = await new Promise<string>((resolve) => {
-        execFile('git', ['diff', '--stat'], { cwd: agent.cwd }, (err, stdout, stderr) => {
-          if (err) {
-            resolve(stderr || err.message);
-          } else {
-            resolve(stdout.trim() || 'No changes.');
-          }
-        });
-      });
-
-      await sendLongMessage(bot, msg.chat.id, `\`\`\`\n${result}\n\`\`\``, 'Markdown');
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
-
-  // /compact — compress conversation context
-  bot.onText(/\/compact/, async (msg) => {
-    if (!isAdmin(msg.chat.id)) return;
-
-    try {
-      const agent = await requireActiveAgent(bot, msg.chat.id);
-      if (!agent) return;
-
-      if (!agent.claude_session_id) {
-        await bot.sendMessage(msg.chat.id, 'No active session to compact.');
-        return;
-      }
-
-      await bot.sendChatAction(msg.chat.id, 'typing');
-
-      // Send /compact as a message to the agent
-      const chunks: string[] = [];
-      await sendAgentMessage(agent, '/compact', (chunk: StreamChunk) => {
-        if (chunk.type === 'text') chunks.push(chunk.content);
-      });
-
-      const response = chunks.join('').trim() || 'Context compacted.';
-      await sendLongMessage(bot, msg.chat.id, response);
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
-
-  // /continue — resume most recent conversation
-  bot.onText(/\/continue(?:\s+([\s\S]+))?/, async (msg, match) => {
-    if (!isAdmin(msg.chat.id)) return;
-
-    try {
-      const agent = await requireActiveAgent(bot, msg.chat.id);
-      if (!agent) return;
-
-      if (!agent.claude_session_id) {
-        await bot.sendMessage(msg.chat.id, 'No session to continue.');
-        return;
-      }
-
-      await bot.sendChatAction(msg.chat.id, 'typing');
-      const extraMessage = match?.[1]?.trim() || '';
-
-      const chunks: string[] = [];
-      await sendAgentMessage(agent, extraMessage, (chunk: StreamChunk) => {
-        if (chunk.type === 'text') chunks.push(chunk.content);
-      }, { continueSession: true });
-
-      const response = chunks.join('').trim();
-      if (response) {
-        await sendLongMessage(bot, msg.chat.id, response, 'Markdown');
+  const result = await new Promise<string>((resolve) => {
+    execFile('git', ['diff', '--stat'], { cwd: agent.cwd }, (err, stdout, stderr) => {
+      if (err) {
+        resolve(stderr || err.message);
       } else {
-        await bot.sendMessage(msg.chat.id, 'Session continued (no new output).');
+        resolve(stdout.trim() || 'No changes.');
       }
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
+    });
   });
 
-  // /fork — fork session into new agent
-  bot.onText(/\/fork/, async (msg) => {
-    if (!isAdmin(msg.chat.id)) return;
+  await sendLongMessage(bot, msg.chat.id, `\`\`\`\n${result}\n\`\`\``, 'Markdown');
+});
 
-    try {
-      const agent = await requireActiveAgent(bot, msg.chat.id);
-      if (!agent) return;
+// ── /session [id] ──
+cmd('session', async (bot, msg, args) => {
+  const agent = await requireActiveAgent(bot, msg.chat.id);
+  if (!agent) return;
 
-      const chatId = msg.chat.id.toString();
-      const forked = await forkAgent(agent.id, chatId, chatId);
+  const sessionId = args.trim();
+  if (!sessionId) {
+    await bot.sendMessage(msg.chat.id,
+      `*Session for ${agent.name}:*\n\`${agent.claude_session_id || 'none'}\`\n\nTo attach: /session <session\\_id>`,
+      { parse_mode: 'Markdown' },
+    );
+    return;
+  }
 
-      await bot.sendMessage(msg.chat.id,
-        `Forked *${agent.name}* → *${forked.name}*\nID: \`${forked.id}\`\nSession cloned. Now active.`,
-        { parse_mode: 'Markdown' },
-      );
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
+  if (sessionId === 'clear') {
+    await updateAgentSession(agent.id, null);
+    await bot.sendMessage(msg.chat.id, 'Session detached.');
+    return;
+  }
+
+  await updateAgentSession(agent.id, sessionId);
+  await bot.sendMessage(msg.chat.id, `Session attached: \`${sessionId}\``, { parse_mode: 'Markdown' });
+});
+
+// ── /compact ──
+cmd('compact', async (bot, msg) => {
+  const agent = await requireActiveAgent(bot, msg.chat.id);
+  if (!agent) return;
+
+  if (!agent.claude_session_id) {
+    await bot.sendMessage(msg.chat.id, 'No active session to compact.');
+    return;
+  }
+
+  await bot.sendChatAction(msg.chat.id, 'typing');
+
+  const chunks: string[] = [];
+  await sendAgentMessage(agent, '/compact', (chunk: StreamChunk) => {
+    if (chunk.type === 'text') chunks.push(chunk.content);
   });
 
-  // /newbot <name> <token> [agent_name_or_id]
-  bot.onText(/\/newbot\s+(\S+)\s+(\S+)(?:\s+(.+))?/, async (msg, match) => {
+  const response = chunks.join('').trim() || 'Context compacted.';
+  await sendLongMessage(bot, msg.chat.id, response);
+});
+
+// ── /continue [message] ──
+cmd('continue', async (bot, msg, args) => {
+  const agent = await requireActiveAgent(bot, msg.chat.id);
+  if (!agent) return;
+
+  if (!agent.claude_session_id) {
+    await bot.sendMessage(msg.chat.id, 'No session to continue.');
+    return;
+  }
+
+  await bot.sendChatAction(msg.chat.id, 'typing');
+  const extraMessage = args.trim();
+
+  const chunks: string[] = [];
+  await sendAgentMessage(agent, extraMessage, (chunk: StreamChunk) => {
+    if (chunk.type === 'text') chunks.push(chunk.content);
+  }, { continueSession: true });
+
+  const response = chunks.join('').trim();
+  if (response) {
+    await sendLongMessage(bot, msg.chat.id, response, 'Markdown');
+  } else {
+    await bot.sendMessage(msg.chat.id, 'Session continued (no new output).');
+  }
+});
+
+// ── /fork ──
+cmd('fork', async (bot, msg) => {
+  const agent = await requireActiveAgent(bot, msg.chat.id);
+  if (!agent) return;
+
+  const chatId = msg.chat.id.toString();
+  const forked = await forkAgent(agent.id, chatId, chatId);
+
+  await bot.sendMessage(msg.chat.id,
+    `Forked *${agent.name}* → *${forked.name}*\nID: \`${forked.id}\`\nSession cloned. Now active.`,
+    { parse_mode: 'Markdown' },
+  );
+});
+
+// ── /newbot <name> <token> [agent] ──
+cmd('newbot', async (bot, msg, args) => {
+  const parts = args.trim().split(/\s+/);
+  const name = parts[0];
+  const token = parts[1];
+  const agentTarget = parts[2];
+
+  if (!name || !token) {
+    await bot.sendMessage(msg.chat.id, 'Usage: /newbot <name> <token> [agent\\_name\\_or\\_id]');
+    return;
+  }
+
+  // Delete the message containing the token for security
+  try {
+    await bot.deleteMessage(msg.chat.id, msg.message_id);
+  } catch {
+    // May fail if bot lacks permissions
+  }
+
+  let agentId: string | undefined;
+  if (agentTarget) {
+    const agents = await listAgents(msg.chat.id.toString());
+    const found = agents.find((a: AgentRow) =>
+      a.name === agentTarget || a.id === agentTarget || a.id.startsWith(agentTarget),
+    );
+    if (found) agentId = found.id;
+  }
+
+  await registerBot(name, token, agentId, msg.chat.id.toString());
+  await bot.sendMessage(msg.chat.id,
+    `Bot *${name}* registered and started.${agentId ? '' : ' No agent linked — link one with /switch on the sub-bot.'}`,
+    { parse_mode: 'Markdown' },
+  );
+});
+
+// ── /bots ──
+cmd('bots', async (bot, msg) => {
+  const bots = await listBots();
+  if (bots.length === 0) {
+    await bot.sendMessage(msg.chat.id, 'No registered bots. Use /newbot <name> <token> to add one.');
+    return;
+  }
+
+  const lines = bots.map((b: any) =>
+    `${b.is_active ? '●' : '○'} *${b.name}*${b.agent_id ? ` → agent \`${b.agent_id.slice(0, 8)}\`` : ' (no agent)'}`,
+  );
+  await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'Markdown' });
+});
+
+// ── /removebot <name> ──
+cmd('removebot', async (bot, msg, args) => {
+  const name = args.trim();
+  if (!name) {
+    await bot.sendMessage(msg.chat.id, 'Usage: /removebot <name>');
+    return;
+  }
+
+  await removeBot(name);
+  await bot.sendMessage(msg.chat.id, `Bot *${name}* removed.`, { parse_mode: 'Markdown' });
+});
+
+// ── Main dispatcher ──
+export function setupHandlers(bot: TelegramBot) {
+  bot.on('message', async (msg) => {
     if (!isAdmin(msg.chat.id)) return;
+    if (!msg.text) return;
 
-    const name = match?.[1];
-    const token = match?.[2];
-    const agentTarget = match?.[3]?.trim();
+    // Parse command
+    const cmdMatch = msg.text.match(/^\/(\w+)(?:@\w+)?(?:\s+([\s\S]*))?$/);
 
-    if (!name || !token) {
-      await bot.sendMessage(msg.chat.id, 'Usage: /newbot <name> <token> [agent_name_or_id]');
+    if (cmdMatch) {
+      const name = cmdMatch[1].toLowerCase();
+      const args = cmdMatch[2] || '';
+      const handler = commands[name];
+      if (!handler) return; // Unknown command, ignore
+
+      try {
+        await handler(bot, msg, args);
+      } catch (err: any) {
+        await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
+      }
       return;
     }
 
-    // Delete the message containing the token for security
-    try {
-      await bot.deleteMessage(msg.chat.id, msg.message_id);
-    } catch {
-      // May fail if bot lacks permissions
-    }
-
-    try {
-      let agentId: string | undefined;
-      if (agentTarget) {
-        const agents = await listAgents(msg.chat.id.toString());
-        const found = agents.find((a: AgentRow) =>
-          a.name === agentTarget || a.id === agentTarget || a.id.startsWith(agentTarget),
-        );
-        if (found) agentId = found.id;
-      }
-
-      await registerBot(name, token, agentId, msg.chat.id.toString());
-      await bot.sendMessage(msg.chat.id,
-        `Bot *${name}* registered and started.${agentId ? '' : ' No agent linked — link one with /switch on the sub-bot.'}`,
-        { parse_mode: 'Markdown' },
-      );
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
-
-  // /bots
-  bot.onText(/\/bots/, async (msg) => {
-    if (!isAdmin(msg.chat.id)) return;
-
-    try {
-      const bots = await listBots();
-      if (bots.length === 0) {
-        await bot.sendMessage(msg.chat.id, 'No registered bots. Use /newbot <name> <token> to add one.');
-        return;
-      }
-
-      const lines = bots.map((b: any) =>
-        `${b.is_active ? '●' : '○'} *${b.name}*${b.agent_id ? ` → agent \`${b.agent_id.slice(0, 8)}\`` : ' (no agent)'}`,
-      );
-      await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'Markdown' });
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
-
-  // /removebot <name>
-  bot.onText(/\/removebot\s+(.+)/, async (msg, match) => {
-    if (!isAdmin(msg.chat.id)) return;
-
-    const name = match?.[1]?.trim();
-    if (!name) return;
-
-    try {
-      await removeBot(name);
-      await bot.sendMessage(msg.chat.id, `Bot *${name}* removed.`, { parse_mode: 'Markdown' });
-    } catch (err: any) {
-      await bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
-    }
-  });
-
-  // Plain messages → active agent
-  bot.on('message', async (msg) => {
-    if (!isAdmin(msg.chat.id)) return;
-    if (!msg.text || msg.text.startsWith('/')) return;
-
+    // Plain text → active agent
     const agent = await getActiveAgent(msg.chat.id.toString());
     if (!agent) {
       await bot.sendMessage(msg.chat.id, 'No active agent. Use /spawn <name> to create one.');
       return;
     }
 
-    // Send "typing" indicator
     await bot.sendChatAction(msg.chat.id, 'typing');
 
     const chunks: string[] = [];
@@ -644,7 +566,6 @@ Total tokens: ${(cost.total_input_tokens + cost.total_output_tokens).toLocaleStr
           chunks.push(`\n_${chunk.content}_\n`);
         }
 
-        // Periodically update the message (every 3 seconds)
         const now = Date.now();
         if (now - lastUpdate > 3000 && chunks.length > 0) {
           lastUpdate = now;
@@ -661,13 +582,12 @@ Total tokens: ${(cost.total_input_tokens + cost.total_output_tokens).toLocaleStr
               sentMessageId = sent.message_id;
             }
           } catch {
-            // Edit may fail if content unchanged, ignore
+            // Edit may fail if content unchanged
           }
           await bot.sendChatAction(msg.chat.id, 'typing');
         }
       });
 
-      // Send final response
       const finalText = chunks.join('').trim();
       if (!finalText) return;
 

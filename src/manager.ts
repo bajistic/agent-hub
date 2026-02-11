@@ -112,6 +112,10 @@ export async function updateAgentCwd(id: string, cwd: string): Promise<void> {
   await query('UPDATE agent_instances SET cwd = ? WHERE id = ?', [cwd, id]);
 }
 
+export async function updateAgentSession(id: string, sessionId: string | null): Promise<void> {
+  await query('UPDATE agent_instances SET claude_session_id = ? WHERE id = ?', [sessionId, id]);
+}
+
 export async function updateAgentModel(id: string, model: string): Promise<void> {
   await query('UPDATE agent_instances SET model = ? WHERE id = ?', [model, id]);
 }

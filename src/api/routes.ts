@@ -7,6 +7,7 @@ import {
   setActiveAgent,
   resetAgent,
   updateAgentCwd,
+  updateAgentSession,
   updateAgentModel,
   updateAgentEffort,
   updateAgentPermissionMode,
@@ -93,6 +94,18 @@ router.patch('/agents/:id/cwd', async (req: Request, res: Response) => {
     }
     await updateAgentCwd(paramId(req), cwd);
     res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Attach/detach session
+router.patch('/agents/:id/session', async (req: Request, res: Response) => {
+  try {
+    const { session_id } = req.body;
+    await updateAgentSession(paramId(req), session_id || null);
+    const agent = await getAgent(paramId(req));
+    res.json(agent);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
